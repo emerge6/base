@@ -948,7 +948,7 @@ void printVersion() {
    | | |   | | |
 
 Openbase Package Manager
-Version: 3.3
+Version: 4.1
 Repository: https://github.com/emerge6/base-packages
 Configuration: /etc/basepm/config.json
 Cache Directory: /var/cache/basepm
