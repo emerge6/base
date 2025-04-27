@@ -22,6 +22,7 @@
 #include <queue>
 #include <future>
 #include <unistd.h>
+#include <functional>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -771,6 +772,42 @@ public:
         logger.log("Clean old versions functionality not implemented", "WARNING");
     }
 
+    void purgeSystem() {
+        logger.log("Initiating system purge of package manager traces", "INFO");
+
+        vector<string> paths_to_remove = {
+            config.getCacheDir(),               
+            "/var/lib/basepm",             
+            "/etc/basepm",                 
+            "/var/log/basepm.log",            
+            "/var/log/basepm.log.1"                 
+        };
+
+        for (const auto& [name, pkg] : installed_packages) {
+            string src_dir = "/tmp/" + pkg.name + "-" + pkg.version.to_string();
+            paths_to_remove.push_back(src_dir);
+        }
+
+        for (const auto& path : paths_to_remove) {
+            if (fs::exists(path)) {
+                try {
+                    fs::remove_all(path);
+                    logger.log("Removed: " + path, "INFO");
+                } catch (const fs::filesystem_error& e) {
+                    logger.log(string("Failed to remove ") + path + ": " + string(e.what()), "WARNING");
+                }
+            } else {
+                logger.log("Path does not exist, skipping: " + path, "DEBUG");
+            }
+        }
+
+        installed_packages.clear();
+        package_cache.clear();
+        logger.log("Cleared internal package databases", "INFO");
+
+        logger.log("System purge completed successfully", "INFO");
+    }
+
     void savePackageDatabase() {
         json db;
         for (const auto& [name, pkg] : installed_packages) {
@@ -914,7 +951,7 @@ private:
 };
 
 void printHelp() {
-    cout << "Base Package Manager v3.3\n"
+    cout << "Base Package Manager v5.9\n"
          << "Использование: base <команда> [опции]\n\n"
          << "Команды:\n"
          << "  infuse <package>      Установить пакет и его зависимости\n"
@@ -925,6 +962,7 @@ void printHelp() {
          << "  lore <package>        Показать информацию о пакете\n"
          << "  clean                 Очистить старые версии пакетов\n"
          << "  web <package>         Показать граф зависимостей\n"
+         << "  purge                 Удалить все следы пакетного менеджера\n"
          << "  help, --help          Показать это сообщение\n\n"
          << "Пример:\n"
          << "  base infuse fastfetch\n"
@@ -948,7 +986,7 @@ void printVersion() {
    | | |   | | |
 
 Openbase Package Manager
-Version: 4.1
+Version: 5.9
 Repository: https://github.com/emerge6/base-packages
 Configuration: /etc/basepm/config.json
 Cache Directory: /var/cache/basepm
@@ -958,7 +996,23 @@ License: GNU Public License v3
 )" << COLOR_RESET;
 }
 
+struct Command {
+    string name;
+    int expected_args;
+    bool requires_root;
+    function<void(BaseCore&, const vector<string>&, bool, bool)> handler;
+};
+
 int main(int argc, char* argv[]) {
+    if (argc < 2 || string(argv[1]) == "help" || string(argv[1]) == "--help") {
+        printHelp();
+        return 0;
+    }
+    if (string(argv[1]) == "-V" || string(argv[1]) == "--version") {
+        printVersion();
+        return 0;
+    }
+
     try {
         CURLcode res = curl_global_init(CURL_GLOBAL_ALL);
         if (res != CURLE_OK) {
@@ -968,22 +1022,41 @@ int main(int argc, char* argv[]) {
         BaseCore core;
         core.loadPackageDatabase();
 
-        if (argc < 2 || string(argv[1]) == "help" || string(argv[1]) == "--help") {
-            printHelp();
-            curl_global_cleanup();
-            return 0;
-        }
+        vector<Command> commands = {
+            {"infuse", 1, true, [](BaseCore& core, const vector<string>& args, bool dry_run, bool verbose) {
+                core.installPackage(args[0], dry_run, verbose);
+            }},
+            {"rip", 1, true, [](BaseCore& core, const vector<string>& args, bool dry_run, bool) {
+                core.removePackage(args[0], dry_run);
+            }},
+            {"pulse", 0, true, [](BaseCore& core, const vector<string>&, bool, bool) {
+                core.syncCache();
+            }},
+            {"list", 0, true, [](BaseCore& core, const vector<string>&, bool, bool) {
+                core.listPackages();
+            }},
+            {"hunt", 1, true, [](BaseCore& core, const vector<string>& args, bool, bool) {
+                core.searchPackages(args[0]);
+            }},
+            {"lore", 1, true, [](BaseCore& core, const vector<string>& args, bool, bool) {
+                core.showPackageInfo(args[0]);
+            }},
+            {"web", 1, true, [](BaseCore& core, const vector<string>& args, bool, bool) {
+                core.printDepGraph(args[0]);
+            }},
+            {"clean", 0, true, [](BaseCore& core, const vector<string>&, bool, bool) {
+                core.cleanOldVersions();
+            }},
+            {"purge", 0, true, [](BaseCore& core, const vector<string>&, bool, bool) {
+                core.purgeSystem();
+            }}
+        };
 
         string command = argv[1];
-        if (command == "-V" || command == "--version") {
-            printVersion();
-            curl_global_cleanup();
-            return 0;
-        }
-
+        vector<string> args(argv + 2, argv + argc);
         bool dry_run = false;
         bool verbose = false;
-        vector<string> args(argv + 2, argv + argc);
+
         if (find(args.begin(), args.end(), "--dry-run") != args.end()) {
             dry_run = true;
             args.erase(remove(args.begin(), args.end(), "--dry-run"), args.end());
@@ -993,24 +1066,25 @@ int main(int argc, char* argv[]) {
             args.erase(remove(args.begin(), args.end(), "--verbose"), args.end());
         }
 
-        if (command == "infuse" && args.size() == 1) {
-            core.installPackage(args[0], dry_run, verbose);
-        } else if (command == "rip" && args.size() == 1) {
-            core.removePackage(args[0], dry_run);
-        } else if (command == "pulse" && args.empty()) {
-            core.syncCache();
-        } else if (command == "list" && args.empty()) {
-            core.listPackages();
-        } else if (command == "hunt" && args.size() == 1) {
-            core.searchPackages(args[0]);
-        } else if (command == "lore" && args.size() == 1) {
-            core.showPackageInfo(args[0]);
-        } else if (command == "web" && args.size() == 1) {
-            core.printDepGraph(args[0]);
-        } else if (command == "clean" && args.empty()) {
-            core.cleanOldVersions();
+        auto it = find_if(commands.begin(), commands.end(), 
+            [&command](const Command& cmd) { return cmd.name == command; });
+
+        if (it != commands.end()) {
+            if (it->requires_root && geteuid() != 0) {
+                cerr << COLOR_RED << "Error: This command requires root privileges" << COLOR_RESET << endl;
+                curl_global_cleanup();
+                return 1;
+            }
+            if (args.size() != static_cast<size_t>(it->expected_args)) {
+                cerr << COLOR_RED << "Error: " << it->name << " expects " << it->expected_args 
+                     << " argument(s)" << COLOR_RESET << endl;
+                printHelp();
+                curl_global_cleanup();
+                return 1;
+            }
+            it->handler(core, args, dry_run, verbose);
         } else {
-            cerr << COLOR_RED << "Unknown command or invalid arguments: " << command << COLOR_RESET << endl;
+            cerr << COLOR_RED << "Unknown command: " << command << COLOR_RESET << endl;
             printHelp();
             curl_global_cleanup();
             return 1;
